@@ -19,6 +19,7 @@ package org.dcache.auth.attributes;
 
 import static java.util.Collections.singleton;
 import static org.hamcrest.CoreMatchers.is;
+import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.MatcherAssert.assertThat;
 
 import diskCacheV111.util.FsPath;
@@ -178,5 +179,16 @@ public class MultiTargetedRestrictionTest {
               TARGET.parent().child("some-sibling")), is(false));
 
         assertThat(restriction.hasUnrestrictedChild(Activity.UPLOAD, TARGET), is(false));
+    }
+
+    @Test
+    public void shouldProvideAuthorisationsInCanonicalOrder() {
+        Authorisation download = new Authorisation(EnumSet.of(Activity.DOWNLOAD), TARGET);
+        Authorisation upload = new Authorisation(EnumSet.of(Activity.UPLOAD),
+              FsPath.create("/completely/different/path"));
+        MultiTargetedRestriction restriction = new MultiTargetedRestriction(
+              List.of(download, upload));
+
+        assertThat(restriction.getAuthorisations(), contains(upload, download));
     }
 }
