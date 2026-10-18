@@ -21,11 +21,13 @@ import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Strings.emptyToNull;
 import static java.lang.Boolean.TRUE;
 import static javax.servlet.http.HttpServletResponse.SC_BAD_REQUEST;
+import static javax.servlet.http.HttpServletResponse.SC_FORBIDDEN;
 import static javax.servlet.http.HttpServletResponse.SC_INTERNAL_SERVER_ERROR;
 import static javax.servlet.http.HttpServletResponse.SC_UNAUTHORIZED;
 import static org.dcache.macaroons.CaveatType.BEFORE;
 import static org.dcache.macaroons.InvalidCaveatException.checkCaveat;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.io.CharStreams;
 import com.google.gson.GsonBuilder;
@@ -46,6 +48,7 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -53,11 +56,13 @@ import javax.security.auth.Subject;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 import org.dcache.auth.Subjects;
+import org.dcache.auth.attributes.Activity;
 import org.dcache.auth.attributes.DenyActivityRestriction;
 import org.dcache.auth.attributes.Expiry;
 import org.dcache.auth.attributes.HomeDirectory;
 import org.dcache.auth.attributes.LoginAttribute;
 import org.dcache.auth.attributes.MaxUploadSize;
+import org.dcache.auth.attributes.MultiTargetedRestriction;
 import org.dcache.auth.attributes.PrefixRestriction;
 import org.dcache.auth.attributes.Restriction;
 import org.dcache.auth.attributes.RootDirectory;
@@ -236,7 +241,8 @@ public class MacaroonRequestHandler extends AbstractHandler implements CellIdent
         return expiry;
     }
 
-    private MacaroonContext buildContext(String target, Request request)
+    @VisibleForTesting
+    MacaroonContext buildContext(String target, HttpServletRequest request, Subject subject)
           throws ErrorResponseException {
 
         MacaroonContext context = new MacaroonContext();
@@ -245,6 +251,7 @@ public class MacaroonRequestHandler extends AbstractHandler implements CellIdent
 
         FsPath userRoot = FsPath.ROOT;
         FsPath prefixRestrictionPath = null;
+        List<MultiTargetedRestriction> multiTargetedRestrictions = new ArrayList<>();
         for (LoginAttribute attr : AuthenticationHandler.getLoginAttributes(request)) {
             if (attr instanceof HomeDirectory) {
                 context.setHome(FsPath.ROOT.resolve(((HomeDirectory) attr).getHome()));
@@ -265,6 +272,8 @@ public class MacaroonRequestHandler extends AbstractHandler implements CellIdent
                             .orElseThrow(() -> new ErrorResponseException(SC_BAD_REQUEST,
                                     "Bad request path: Desired path not within existing path"));
                 }
+            } else if (attr instanceof MultiTargetedRestriction) {
+                multiTargetedRestrictions.add((MultiTargetedRestriction) attr);
             } else if (attr instanceof Restriction) {
                 throw new ErrorResponseException(SC_BAD_REQUEST,
                       "Cannot serialise restriction " + attr.getClass().getSimpleName());
@@ -278,7 +287,6 @@ public class MacaroonRequestHandler extends AbstractHandler implements CellIdent
             }
         }
 
-        Subject subject = getSubject();
         context.setUid(Subjects.getUid(subject));
         context.setGids(Subjects.getGids(subject));
         context.setUsername(Subjects.getUserName(subject));
@@ -292,6 +300,38 @@ public class MacaroonRequestHandler extends AbstractHandler implements CellIdent
                 ? prefixRestrictionPath
                 : target.equals("/") ? null : desiredPath;
 
+        if (!multiTargetedRestrictions.isEmpty()) {
+            /* A MultiTargetedRestriction (e.g., from the storage.* scopes of a
+             * WLCG or SciTokens token) allows different activities on different
+             * paths, while a macaroon has a single path and a single set of
+             * activities.  The macaroon is therefore limited to the requested
+             * path and allows only those activities that each restriction
+             * allows everywhere within that path: those of the authorisations
+             * for that path or one of its parents.  Authorisations for paths
+             * below the requested path cannot be expressed; a client that
+             * needs them may request a macaroon for such a path.
+             */
+            if (!target.equals("/")) {
+                path = desiredPath;
+            }
+            FsPath macaroonPath = path != null ? path : desiredPath;
+            for (MultiTargetedRestriction restriction : multiTargetedRestrictions) {
+                EnumSet<Activity> allowed = activitiesAllowedWithin(restriction, macaroonPath);
+                if (allowed.isEmpty()) {
+                    throw new ErrorResponseException(SC_FORBIDDEN,
+                          "Restriction allows no activity within " + target);
+                }
+                /* A macaroon that allows any activity implicitly allows
+                 * READ_METADATA (see MacaroonContext#getAllowedActivities).
+                 */
+                if (!allowed.contains(Activity.READ_METADATA)) {
+                    throw new ErrorResponseException(SC_BAD_REQUEST,
+                          "Cannot serialise restriction without READ_METADATA activity");
+                }
+                context.keepActivities(allowed);
+            }
+        }
+
         if (path != null) {
             context.setPath(path.stripPrefix(effectiveRoot));
         }
@@ -299,6 +339,23 @@ public class MacaroonRequestHandler extends AbstractHandler implements CellIdent
         return context;
     }
 
+    /**
+     * Return the activities that the restriction allows on the supplied path and on everything
+     * below it; i.e., the activities of all authorisations for that path or one of its parents.
+     * Authorisations for paths below the supplied path contribute nothing, nor do the activities
+     * that the restriction allows on the parents of an authorised path.
+     */
+    private static EnumSet<Activity> activitiesAllowedWithin(MultiTargetedRestriction restriction,
+          FsPath path) {
+        EnumSet<Activity> allowed = EnumSet.noneOf(Activity.class);
+        for (MultiTargetedRestriction.Authorisation authorisation :
+              restriction.getAuthorisations()) {
+            if (path.hasPrefix(authorisation.getPath())) {
+                allowed.addAll(authorisation.getActivity());
+            }
+        }
+        return allowed;
+    }
 
     private String buildMacaroon(String target, Request request) throws ErrorResponseException {
         checkValidRequest(request.isSecure(), "Not secure transport");
@@ -306,7 +363,7 @@ public class MacaroonRequestHandler extends AbstractHandler implements CellIdent
             throw new ErrorResponseException(SC_UNAUTHORIZED, "Authentication required");
         }
 
-        MacaroonContext context = buildContext(target, request);
+        MacaroonContext context = buildContext(target, request, getSubject());
 
         MacaroonRequest macaroonRequest = parseJSON(request);
 

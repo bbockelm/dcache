@@ -24,6 +24,7 @@ import com.google.common.collect.Ordering;
 import diskCacheV111.util.FsPath;
 import java.io.Serializable;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.Set;
@@ -120,6 +121,14 @@ public class MultiTargetedRestriction implements Restriction {
         Set<Authorisation> combined = new HashSet(authorisations);
         combined.addAll(authz);
         return new MultiTargetedRestriction(combined);
+    }
+
+    /**
+     * Return the Authorisations of this restriction, in canonical order.  The paths are as
+     * supplied, without any path resolution.
+     */
+    public Collection<Authorisation> getAuthorisations() {
+        return Collections.unmodifiableCollection(authorisations);
     }
 
     @Override
